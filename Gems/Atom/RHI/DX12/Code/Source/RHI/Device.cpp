@@ -22,6 +22,8 @@
 #include <AzCore/Memory/SystemAllocator.h>
 #include <AzCore/Memory/AllocatorInstance.h>
 
+#include <Atom/RHI.Reflect/DX12/DX12Bus.h>
+
 namespace AZ
 {
     namespace DX12
@@ -29,7 +31,7 @@ namespace AZ
 #ifdef USE_AMD_D3D12MA
         namespace
         {
-            constexpr D3D12MA::ALLOCATOR_FLAGS s_D3d12maAllocatorFlags = D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED;
+            constexpr D3D12MA::ALLOCATOR_FLAGS s_D3d12maAllocatorFlags = static_cast<D3D12MA::ALLOCATOR_FLAGS>(D3D12MA::ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED);
             D3D12MA::ALLOCATION_CALLBACKS s_AllocationCallbacks = {};
 
             // constant value attached to D3D12MA cpu memory allocations
@@ -230,6 +232,7 @@ namespace AZ
             m_features.m_indirectDrawCountBufferSupported = true;
             m_features.m_indirectDispatchCountBufferSupported = true;
             m_features.m_indirectDrawStartInstanceLocationSupported = true;
+            m_features.m_signalFenceFromCPU = true;
 
             // DXGI_SCALING_ASPECT_RATIO_STRETCH is only compatible with CreateSwapChainForCoreWindow or CreateSwapChainForComposition,
             // not Win32 window handles and associated methods (cannot find an MSDN source for that)
@@ -308,8 +311,6 @@ namespace AZ
                     RHI::ShadingRateFlags::Rate4x4;
             }
 
-            m_features.m_signalFenceFromCPU = true;
-
             m_limits.m_shadingRateTileSize = RHI::Size(options6.ShadingRateImageTileSize, options6.ShadingRateImageTileSize, 1);
 #endif
 
@@ -367,6 +368,11 @@ namespace AZ
         {
             auto durationInSeconds = AZStd::chrono::duration<double>(double(gpuTimestamp) / m_commandQueueContext.GetCommandQueue(queueClass).GetGpuTimestampFrequency());
             return AZStd::chrono::duration_cast<AZStd::chrono::microseconds>(durationInSeconds);
+        }
+
+        AZStd::pair<uint64_t, uint64_t> Device::GetCalibratedTimestamp(RHI::HardwareQueueClass queueClass)
+        {
+            return m_commandQueueContext.GetCommandQueue(queueClass).GetClockCalibration();
         }
 
         void Device::FillFormatsCapabilitiesInternal(FormatCapabilitiesList& formatsCapabilities)
@@ -534,15 +540,17 @@ namespace AZ
                 clearValue = ConvertClearValue(imageDescriptor.m_format, *optimizedClearValue);
             }
 
+            D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+            DX12RequirementBus::Broadcast(&DX12RequirementBus::Events::CollectAllocatorExtraHeapFlags, heapFlags, heapType);
+
             Microsoft::WRL::ComPtr<ID3D12Resource> resource;
             HRESULT result = m_dx12Device->CreateCommittedResource(
-                &heapProperties, 
-                D3D12_HEAP_FLAG_NONE, 
-                &resourceDesc, 
-                initialState, 
-                (isOutputMergerAttachment && optimizedClearValue) ? &clearValue : nullptr, 
-                IID_GRAPHICS_PPV_ARGS(resource.GetAddressOf())
-            );
+                &heapProperties,
+                heapFlags,
+                &resourceDesc,
+                initialState,
+                (isOutputMergerAttachment && optimizedClearValue) ? &clearValue : nullptr,
+                IID_GRAPHICS_PPV_ARGS(resource.GetAddressOf()));
 
             AZ_RHI_DUMP_POOL_INFO_ON_FAIL(SUCCEEDED(result));
             AssertSuccess(result);
@@ -550,7 +558,7 @@ namespace AZ
             D3D12_RESOURCE_ALLOCATION_INFO allocationInfo;
             GetImageAllocationInfo(imageDescriptor, allocationInfo);
 
-            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image);
+            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image, nullptr, 0);
         }
 
         void Device::ConvertBufferDescriptorToResourceDesc(
@@ -578,6 +586,7 @@ namespace AZ
 
             D3D12MA::ALLOCATION_DESC allocDesc = {};
             allocDesc.HeapType = heapType;
+            DX12RequirementBus::Broadcast(&DX12RequirementBus::Events::CollectAllocatorExtraHeapFlags, allocDesc.ExtraHeapFlags, heapType);
 
             D3D12MA::Allocation* allocation = nullptr;
             Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -601,16 +610,13 @@ namespace AZ
             D3D12_RESOURCE_DESC resourceDesc;
             ConvertBufferDescriptorToResourceDesc(bufferDescriptor, initialState, resourceDesc);
 
+            D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+            DX12RequirementBus::Broadcast(&DX12RequirementBus::Events::CollectAllocatorExtraHeapFlags, heapFlags, heapType);
+
             CD3DX12_HEAP_PROPERTIES heapProperties(heapType);
             Microsoft::WRL::ComPtr<ID3D12Resource> resource;
             HRESULT result = m_dx12Device->CreateCommittedResource(
-                &heapProperties, 
-                D3D12_HEAP_FLAG_NONE, 
-                &resourceDesc, 
-                initialState, 
-                nullptr, 
-                IID_GRAPHICS_PPV_ARGS(resource.GetAddressOf())
-            );
+                &heapProperties, heapFlags, &resourceDesc, initialState, nullptr, IID_GRAPHICS_PPV_ARGS(resource.GetAddressOf()));
             AZ_RHI_DUMP_POOL_INFO_ON_FAIL(SUCCEEDED(result));
             AssertSuccess(result);
 
@@ -618,7 +624,7 @@ namespace AZ
             allocationInfo.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
             allocationInfo.SizeInBytes = RHI::AlignUp(resourceDesc.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
 
-            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Buffer);
+            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Buffer, nullptr, 0);
         }
 
         MemoryView Device::CreateBufferPlaced(
@@ -646,7 +652,8 @@ namespace AZ
             AZ_RHI_DUMP_POOL_INFO_ON_FAIL(SUCCEEDED(result));
             AssertSuccess(result);
 
-            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Buffer);
+            return MemoryView(
+                resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Buffer, heap, heapByteOffset);
         }
 
         static uint64_t GetPlacedTextureAlignment(const RHI::ImageDescriptor& imageDescriptor)
@@ -702,7 +709,8 @@ namespace AZ
             AZ_RHI_DUMP_POOL_INFO_ON_FAIL(SUCCEEDED(result));
             AssertSuccess(result);
 
-            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image);
+            return MemoryView(
+                resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image, heap, heapByteOffset);
         }
 
         MemoryView Device::CreateImageReserved(
@@ -749,7 +757,7 @@ namespace AZ
             D3D12_RESOURCE_ALLOCATION_INFO allocationInfo;
             GetImageAllocationInfo(imageDescriptor, allocationInfo);
 
-            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image);
+            return MemoryView(resource.Get(), 0, allocationInfo.SizeInBytes, allocationInfo.Alignment, MemoryViewType::Image, nullptr, 0);
         }
 
         void Device::GetImageAllocationInfo(
